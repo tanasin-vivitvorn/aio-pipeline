@@ -9,32 +9,34 @@ local development (Docker Compose) and production deployment (Kubernetes).
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │                      sum-net / module2                   │
-│                                                         │
-│  ┌──────────────┐    ┌──────────────┐                   │
-│  │  Jenkins UI  │───▶│   Jenkins    │◀── LDAP (slapd)   │
-│  │  (Next.js)   │    │  + ZAP daemon│                   │
-│  │  :3000       │    │  :8080/jenkins│                  │
-│  └──────────────┘    └──────┬───────┘                   │
-│                             │                           │
-│              ┌──────────────┼──────────────┐            │
-│              ▼              ▼              ▼            │
-│        ┌──────────┐  ┌──────────┐  ┌──────────┐        │
-│        │ Sandbox  │  │SonarQube │  │  Nexus   │        │
-│        │ + DinD   │  │  :9000   │  │  :8081   │        │
-│        │  :9100   │  └──────────┘  └──────────┘        │
-│        └──────────┘                                     │
-└─────────────────────────────────────────────────────────┘
+│                                                          │
+│  ┌──────────────┐    ┌───────────────┐                   │
+│  │  Jenkins UI  │───▶│   Jenkins     │◀── LDAP (slapd)   │
+│  │  (Next.js)   │    │  + Playwright │                   │
+|  |              |    |  + ZAP daemon |                   |
+|  |              |    |  + JMeter     |                   |
+│  │  :3000       │    │  :8080/jenkins│                   │
+│  └──────────────┘    └──────┬────────┘                   │
+│                             │                            │
+│              ┌──────────────┼──────────────┐             │
+│              ▼              ▼              ▼             │
+│        ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│        │ Sandbox  │  │SonarQube │  │  Nexus   │          │
+│        │ + DinD   │  │  :9000   │  │  :8081   │          │
+│        │  :9100   │  └──────────┘  └──────────┘          │
+│        └──────────┘                                      │
+└──────────────────────────────────────────────────────────┘
 ```
 
-| Service | Description | Local Port |
-|---|---|---|
-| Jenkins UI | Custom Next.js frontend with CSRF-protected API proxy | 3000 |
-| Jenkins | CI/CD server with Playwright, JMeter, ZAP, SonarQube Scanner, and slapd (LDAP) built in | 8080 |
-| Sandbox | Docker-in-Docker execution environment — receives uploaded ZIPs, runs compose stacks | 9100 |
-| SonarQube | Static code analysis and quality gate | 9000 |
-| Nexus | Artifact repository (raw, Maven, npm) | 8081 |
+| Service    | Description                                                                             | Local Port |
+| ---------- | --------------------------------------------------------------------------------------- | ---------- |
+| Jenkins UI | Custom Next.js frontend with CSRF-protected API proxy                                   | 3000       |
+| Jenkins    | CI/CD server with Playwright, JMeter, ZAP, SonarQube Scanner, and slapd (LDAP) built in | 8080       |
+| Sandbox    | Docker-in-Docker execution environment — receives uploaded ZIPs, runs compose stacks    | 9100       |
+| SonarQube  | Static code analysis and quality gate                                                   | 9000       |
+| Nexus      | Artifact repository (raw, Maven, npm)                                                   | 8081       |
 
 ---
 
@@ -70,13 +72,13 @@ docker compose up -d --build
 
 **3. Access services:**
 
-| Service | URL | Default credentials |
-|---|---|---|
-| Jenkins UI | http://localhost:3000 | admin / admin123 |
-| Jenkins | http://localhost:8080/jenkins | admin / admin123 (LDAP) |
-| SonarQube | http://localhost:9000 | admin / admin |
-| Nexus | http://localhost:8081 | admin / (see setup) |
-| Sandbox API | http://localhost:9100 | token via `SANDBOX_TOKEN` |
+| Service     | URL                           | Default credentials       |
+| ----------- | ----------------------------- | ------------------------- |
+| Jenkins UI  | http://localhost:3000         | admin / admin123          |
+| Jenkins     | http://localhost:8080/jenkins | admin / admin123 (LDAP)   |
+| SonarQube   | http://localhost:9000         | admin / admin             |
+| Nexus       | http://localhost:8081         | admin / (see setup)       |
+| Sandbox API | http://localhost:9100         | token via `SANDBOX_TOKEN` |
 
 ---
 
@@ -90,14 +92,14 @@ kubectl apply -f module2-sandbox-dind.yml
 
 **Before applying**, update the secrets in the manifest:
 
-| Resource | Key | Description |
-|---|---|---|
-| `ldap-credentials` | `admin-password` | LDAP admin password |
-| `jenkins-pipeline-secret` | `SANDBOX_TOKEN` | Sandbox authentication token |
-| `jenkins-pipeline-secret` | `NEXUS_PASSWORD` | Nexus admin password |
-| `jenkins-pipeline-secret` | `SONAR_TOKEN` | SonarQube user token |
-| `jenkins-ui-secret` | `JENKINS_TOKEN` | Jenkins API token |
-| `jenkins-ui-secret` | `SESSION_SECRET` | Next.js session signing secret |
+| Resource                  | Key              | Description                    |
+| ------------------------- | ---------------- | ------------------------------ |
+| `ldap-credentials`        | `admin-password` | LDAP admin password            |
+| `jenkins-pipeline-secret` | `SANDBOX_TOKEN`  | Sandbox authentication token   |
+| `jenkins-pipeline-secret` | `NEXUS_PASSWORD` | Nexus admin password           |
+| `jenkins-pipeline-secret` | `SONAR_TOKEN`    | SonarQube user token           |
+| `jenkins-ui-secret`       | `JENKINS_TOKEN`  | Jenkins API token              |
+| `jenkins-ui-secret`       | `SESSION_SECRET` | Next.js session signing secret |
 
 To check rollout status:
 
@@ -113,19 +115,19 @@ kubectl -n module2 get pods
 Pipeline behaviour is controlled by the `jenkins-pipeline-config` ConfigMap (K8s) or the Jenkins
 container environment (Docker Compose). All keys and their defaults:
 
-| Key | Default | Description |
-|---|---|---|
-| `SANDBOX_URL` | `http://sandbox:9100` | Sandbox API base URL |
-| `SANDBOX_HOST_FOR_TEST` | `sandbox` | Hostname used inside generated Playwright specs |
-| `SANDBOX_APP_PORT` | `8888` | Port the deployed application exposes |
-| `ZAP_PORT` | `8090` | ZAP daemon API port (inside Jenkins container) |
-| `NEXUS_URL` | `http://nexus:8081` | Nexus base URL |
-| `NEXUS_REPOSITORY` | `sum` | Default raw repository for artifact uploads |
-| `NEXUS_USERNAME` | `admin` | Nexus username |
-| `SONAR_HOST_URL` | `http://sonarqube:9000` | SonarQube server URL |
-| `PLAYWRIGHT_HOME` | `/app/playwright` | Playwright installation path (inside Jenkins image) |
-| `JMETER_HOME` | `/app/jmeter` | JMeter installation path |
-| `ZAP_HOME` | `/app/zap` | ZAP installation path |
+| Key                     | Default                 | Description                                         |
+| ----------------------- | ----------------------- | --------------------------------------------------- |
+| `SANDBOX_URL`           | `http://sandbox:9100`   | Sandbox API base URL                                |
+| `SANDBOX_HOST_FOR_TEST` | `sandbox`               | Hostname used inside generated Playwright specs     |
+| `SANDBOX_APP_PORT`      | `8888`                  | Port the deployed application exposes               |
+| `ZAP_PORT`              | `8090`                  | ZAP daemon API port (inside Jenkins container)      |
+| `NEXUS_URL`             | `http://nexus:8081`     | Nexus base URL                                      |
+| `NEXUS_REPOSITORY`      | `sum`                   | Default raw repository for artifact uploads         |
+| `NEXUS_USERNAME`        | `admin`                 | Nexus username                                      |
+| `SONAR_HOST_URL`        | `http://sonarqube:9000` | SonarQube server URL                                |
+| `PLAYWRIGHT_HOME`       | `/app/playwright`       | Playwright installation path (inside Jenkins image) |
+| `JMETER_HOME`           | `/app/jmeter`           | JMeter installation path                            |
+| `ZAP_HOME`              | `/app/zap`              | ZAP installation path                               |
 
 ---
 
@@ -134,13 +136,13 @@ container environment (Docker Compose). All keys and their defaults:
 The `Jenkinsfie` (seed-loaded into Jenkins via JCasC) runs automatically when a job is triggered
 from the Jenkins UI. It accepts the following parameters:
 
-| Parameter | Type | Description |
-|---|---|---|
-| `APP_ZIP` | File | ZIP archive containing a `docker-compose.yml` at root |
-| `NEXUS_RAW_DIRECTORY` | String | Nexus raw directory for the uploaded artifact |
-| `ZAP_SCAN_TYPE` | Choice | `baseline` / `full` / `api` |
-| `RUN_PLAYWRIGHT` | Boolean | Run Playwright E2E tests (default: true) |
-| `RUN_JMETER` | Boolean | Run JMeter performance test (default: false) |
+| Parameter             | Type    | Description                                           |
+| --------------------- | ------- | ----------------------------------------------------- |
+| `APP_ZIP`             | File    | ZIP archive containing a `docker-compose.yml` at root |
+| `NEXUS_RAW_DIRECTORY` | String  | Nexus raw directory for the uploaded artifact         |
+| `ZAP_SCAN_TYPE`       | Choice  | `baseline` / `full` / `api`                           |
+| `RUN_PLAYWRIGHT`      | Boolean | Run Playwright E2E tests (default: true)              |
+| `RUN_JMETER`          | Boolean | Run JMeter performance test (default: false)          |
 
 **Pipeline stages:**
 
