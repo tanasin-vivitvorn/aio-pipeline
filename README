@@ -1,0 +1,269 @@
+# SUM — Secure Unified MAST Platform
+
+An integrated CI/CD quality-gate platform that combines static analysis, end-to-end testing,
+security scanning, and performance testing into a single automated pipeline. Designed for both
+local development (Docker Compose) and production deployment (Kubernetes).
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      sum-net / module2                   │
+│                                                         │
+│  ┌──────────────┐    ┌──────────────┐                   │
+│  │  Jenkins UI  │───▶│   Jenkins    │◀── LDAP (slapd)   │
+│  │  (Next.js)   │    │  + ZAP daemon│                   │
+│  │  :3000       │    │  :8080/jenkins│                  │
+│  └──────────────┘    └──────┬───────┘                   │
+│                             │                           │
+│              ┌──────────────┼──────────────┐            │
+│              ▼              ▼              ▼            │
+│        ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│        │ Sandbox  │  │SonarQube │  │  Nexus   │        │
+│        │ + DinD   │  │  :9000   │  │  :8081   │        │
+│        │  :9100   │  └──────────┘  └──────────┘        │
+│        └──────────┘                                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+| Service | Description | Local Port |
+|---|---|---|
+| Jenkins UI | Custom Next.js frontend with CSRF-protected API proxy | 3000 |
+| Jenkins | CI/CD server with Playwright, JMeter, ZAP, SonarQube Scanner, and slapd (LDAP) built in | 8080 |
+| Sandbox | Docker-in-Docker execution environment — receives uploaded ZIPs, runs compose stacks | 9100 |
+| SonarQube | Static code analysis and quality gate | 9000 |
+| Nexus | Artifact repository (raw, Maven, npm) | 8081 |
+
+---
+
+## Prerequisites
+
+- Docker ≥ 24 and Docker Compose v2
+- 8 GB RAM available (SonarQube alone needs ~2 GB)
+- The following ports free: `3000`, `8080`, `8081`, `8090`, `9000`, `9100`
+
+---
+
+## Quick Start (Docker Compose)
+
+**1. Create a `.env` file** in the project root (copy from the example below and fill in real values):
+
+```bash
+# .env
+JENKINS_TOKEN=<admin-api-token>
+SANDBOX_TOKEN=<strong-random-token>
+NEXUS_PASSWORD=<nexus-admin-password>
+LDAP_ADMIN_PASSWORD=<ldap-admin-password>
+SONAR_TOKEN=<sonarqube-user-token>        # optional until SonarQube is configured
+SESSION_SECRET=<long-random-string>
+```
+
+**2. Build and start all services:**
+
+```bash
+docker compose up -d --build
+```
+
+> The Jenkins image build takes 10–15 minutes on first run (downloads Playwright browsers, JMeter, ZAP).
+
+**3. Access services:**
+
+| Service | URL | Default credentials |
+|---|---|---|
+| Jenkins UI | http://localhost:3000 | admin / admin123 |
+| Jenkins | http://localhost:8080/jenkins | admin / admin123 (LDAP) |
+| SonarQube | http://localhost:9000 | admin / admin |
+| Nexus | http://localhost:8081 | admin / (see setup) |
+| Sandbox API | http://localhost:9100 | token via `SANDBOX_TOKEN` |
+
+---
+
+## Kubernetes Deployment
+
+All resources deploy into the `module2` namespace.
+
+```bash
+kubectl apply -f module2-sandbox-dind.yml
+```
+
+**Before applying**, update the secrets in the manifest:
+
+| Resource | Key | Description |
+|---|---|---|
+| `ldap-credentials` | `admin-password` | LDAP admin password |
+| `jenkins-pipeline-secret` | `SANDBOX_TOKEN` | Sandbox authentication token |
+| `jenkins-pipeline-secret` | `NEXUS_PASSWORD` | Nexus admin password |
+| `jenkins-pipeline-secret` | `SONAR_TOKEN` | SonarQube user token |
+| `jenkins-ui-secret` | `JENKINS_TOKEN` | Jenkins API token |
+| `jenkins-ui-secret` | `SESSION_SECRET` | Next.js session signing secret |
+
+To check rollout status:
+
+```bash
+kubectl -n module2 rollout status deployment/jenkins
+kubectl -n module2 get pods
+```
+
+---
+
+## Configuration
+
+Pipeline behaviour is controlled by the `jenkins-pipeline-config` ConfigMap (K8s) or the Jenkins
+container environment (Docker Compose). All keys and their defaults:
+
+| Key | Default | Description |
+|---|---|---|
+| `SANDBOX_URL` | `http://sandbox:9100` | Sandbox API base URL |
+| `SANDBOX_HOST_FOR_TEST` | `sandbox` | Hostname used inside generated Playwright specs |
+| `SANDBOX_APP_PORT` | `8888` | Port the deployed application exposes |
+| `ZAP_PORT` | `8090` | ZAP daemon API port (inside Jenkins container) |
+| `NEXUS_URL` | `http://nexus:8081` | Nexus base URL |
+| `NEXUS_REPOSITORY` | `sum` | Default raw repository for artifact uploads |
+| `NEXUS_USERNAME` | `admin` | Nexus username |
+| `SONAR_HOST_URL` | `http://sonarqube:9000` | SonarQube server URL |
+| `PLAYWRIGHT_HOME` | `/app/playwright` | Playwright installation path (inside Jenkins image) |
+| `JMETER_HOME` | `/app/jmeter` | JMeter installation path |
+| `ZAP_HOME` | `/app/zap` | ZAP installation path |
+
+---
+
+## Pipeline
+
+The `Jenkinsfie` (seed-loaded into Jenkins via JCasC) runs automatically when a job is triggered
+from the Jenkins UI. It accepts the following parameters:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `APP_ZIP` | File | ZIP archive containing a `docker-compose.yml` at root |
+| `NEXUS_RAW_DIRECTORY` | String | Nexus raw directory for the uploaded artifact |
+| `ZAP_SCAN_TYPE` | Choice | `baseline` / `full` / `api` |
+| `RUN_PLAYWRIGHT` | Boolean | Run Playwright E2E tests (default: true) |
+| `RUN_JMETER` | Boolean | Run JMeter performance test (default: false) |
+
+**Pipeline stages:**
+
+```
+Verify Tools → Deploy ZIP to Sandbox → Inventory Scan → SonarQube Analysis
+    → Playwright Tests → OWASP ZAP Security Scan → JMeter Performance Test
+    → Generate Combined Report → Copy Reports → Upload to Nexus
+```
+
+All stage results are merged into a single `reports/summary-report.json` and archived as
+Jenkins build artifacts. If the ZAP scan finds HIGH or CRITICAL vulnerabilities the build
+is marked **UNSTABLE**.
+
+---
+
+## Directory Structure
+
+```
+.
+├── docker-compose.yml              # Local development stack
+├── module2-sandbox-dind.yml        # Kubernetes manifests (namespace: module2)
+├── jenkins-sandbox/
+│   ├── jenkins/
+│   │   ├── Dockerfile              # Jenkins custom image (tools + slapd + JCasC)
+│   │   ├── jenkins.yaml            # JCasC configuration
+│   │   ├── Jenkinsfie              # Declarative pipeline definition
+│   │   ├── seed.groovy             # Job DSL seed script
+│   │   ├── plugins.txt             # Pre-installed Jenkins plugins
+│   │   ├── start.sh                # Container entrypoint (LDAP setup → ZAP → Jenkins)
+│   │   └── sh/                     # Inventory scanner scripts
+│   └── sandbox/
+│       ├── Dockerfile
+│       └── server.js               # Sandbox API server (upload, deploy, destroy)
+├── jenkins-ui/                     # Next.js frontend
+│   ├── app/
+│   │   ├── api/                    # Route handlers (jenkins, nexus, auth)
+│   │   └── login/                  # Login page with challenge-based encryption
+│   ├── lib/
+│   │   ├── auth.ts                 # Session tokens, CSRF, challenge helpers
+│   │   ├── apiClient.ts            # Browser-side fetch wrapper (CSRF header)
+│   │   └── clientCrypto.ts         # AES-GCM password encryption (HTTP XOR fallback)
+│   └── middleware.ts               # Edge CSRF double-submit validation
+├── nexus/                          # Nexus compose (standalone)
+└── demo-module/                    # Sample application for pipeline testing
+```
+
+---
+
+## Operations
+
+```bash
+# Start all services
+docker compose up -d
+
+# Stop all services (keep volumes)
+docker compose down
+
+# Stop and remove all data volumes
+docker compose down -v
+
+# View logs for a specific service
+docker compose logs -f jenkins
+
+# Rebuild a single service image
+docker compose build jenkins && docker compose up -d jenkins
+
+# Get a shell inside the Jenkins container
+docker compose exec jenkins bash
+```
+
+---
+
+## Initial Setup: Nexus
+
+Nexus does not have a default password baked in. On first run, retrieve it:
+
+```bash
+docker compose exec nexus cat /nexus-data/admin.password
+```
+
+Log in at http://localhost:8081 with `admin` + the password above, complete the setup wizard,
+then create a **raw (hosted)** repository named `sum` for pipeline artifact uploads.
+
+---
+
+## Initial Setup: SonarQube
+
+1. Log in at http://localhost:9000 with `admin` / `admin` and set a new password.
+2. Create a project and generate a **User Token**.
+3. Set `SONAR_TOKEN=<token>` in your `.env` file (or update the `jenkins-pipeline-secret` Secret in K8s).
+4. Restart Jenkins so it picks up the new token.
+
+---
+
+## Troubleshooting
+
+**Jenkins image fails to build on Apple Silicon (ARM64)**
+
+The SonarQube Scanner download is architecture-aware. If you see a Rosetta error, ensure
+you are building for the native platform:
+
+```bash
+docker compose build --no-cache jenkins
+```
+
+**SonarQube fails to start (Elasticsearch exit code 1)**
+
+This usually means `vm.max_map_count` is too low. The image uses
+`SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true` to bypass this for containerised deployments.
+If the error persists, check that the SonarQube container has at least 2 GB of memory.
+
+**Sandbox returns 401**
+
+Verify that `SANDBOX_TOKEN` in the Jenkins environment matches the value in the Sandbox
+container. In K8s, both are sourced from `jenkins-pipeline-secret`.
+
+**Jenkins UI login redirects back to `/login`**
+
+Confirm that the `SESSION_SECRET` and `JENKINS_TOKEN` are set in the Jenkins UI environment
+(`jenkins-ui-secret` in K8s / `jenkins-ui/.env.local` locally).
+
+**ZAP not responding during pipeline**
+
+ZAP is started at container boot by `start.sh`. If it is not ready within 60 seconds, the
+pipeline prints the last 30 lines of `/var/jenkins_home/zap-daemon.log`. Check that port
+`8090` is not bound by another process inside the container.

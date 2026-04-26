@@ -1,0 +1,153 @@
+version: "3.8"
+
+# Usage:
+#   docker compose up -d
+#   docker compose down -v   (removes volumes too)
+#
+# Required env file: jenkins-ui/.env.local
+#   JENKINS_TOKEN=<admin API token>
+#
+# Services:
+#   jenkins      http://localhost:8080/jenkins
+#   jenkins-ui   http://localhost:3000
+#   nexus        http://localhost:8081
+#   sandbox      http://localhost:9100
+#   sonarqube    http://localhost:9000
+
+services:
+
+  # ── Jenkins (custom image — build context must be project root) ──────────
+  jenkins:
+    build:
+      context: .
+      dockerfile: jenkins-sandbox/jenkins/Dockerfile
+    image: tontanasin/sum-jenkins:2.0
+    container_name: jenkins
+    restart: unless-stopped
+    platform: linux/amd64
+    user: "0:0"
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+      - "8090:8090"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - jenkins_data:/jenkins-data
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+      JENKINS_OPTS: "--prefix=/jenkins"
+      LDAP_ADMIN_PASSWORD: "${LDAP_ADMIN_PASSWORD:-admin123}"
+      # Pipeline config (mirrors jenkins-pipeline-config ConfigMap)
+      SANDBOX_URL: "http://sandbox:9100"
+      SANDBOX_HOST_FOR_TEST: "sandbox"
+      SANDBOX_APP_PORT: "8888"
+      PLAYWRIGHT_HOME: "/app/playwright"
+      JMETER_HOME: "/app/jmeter"
+      ZAP_HOME: "/app/zap"
+      ZAP_PORT: "8090"
+      NEXUS_URL: "http://nexus:8081"
+      NEXUS_REPOSITORY: "sum"
+      NEXUS_USERNAME: "admin"
+      SONAR_HOST_URL: "http://sonarqube:9000"
+      # Pipeline secrets (mirrors jenkins-pipeline-secret Secret)
+      SANDBOX_TOKEN: "${SANDBOX_TOKEN:-change-me-strong-token}"
+      NEXUS_PASSWORD: "${NEXUS_PASSWORD:-admin123}"
+      SONAR_TOKEN: "${SONAR_TOKEN:-}"
+    networks:
+      - sum-net
+
+  # ── Jenkins UI (Next.js front-end) ────────────────────────────────────────
+  jenkins-ui:
+    build:
+      context: jenkins-ui
+      dockerfile: Dockerfile
+    container_name: jenkins-ui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      JENKINS_URL: "http://jenkins:8080"
+      JENKINS_USERNAME: "${JENKINS_USERNAME:-admin}"
+      JENKINS_TOKEN: "${JENKINS_TOKEN}"
+    env_file:
+      - jenkins-ui/.env.local
+    depends_on:
+      - jenkins
+    networks:
+      - sum-net
+
+  # ── Nexus ─────────────────────────────────────────────────────────────────
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: nexus
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - nexus_data:/nexus-data
+    environment:
+      INSTALL4J_ADD_VM_PARAMS: "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=2g
+        -Djava.util.prefs.userRoot=/nexus-data/javaprefs"
+    networks:
+      - sum-net
+
+  # ── Sandbox (Docker-in-Docker sidecar pattern) ────────────────────────────
+  sandbox-dind:
+    image: docker:27-dind
+    container_name: sandbox-dind
+    restart: unless-stopped
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    networks:
+      - sum-net
+
+  sandbox:
+    image: tontanasin/sum-sandbox:1.0
+    container_name: sandbox
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+      - "8888:8888"
+    depends_on:
+      - sandbox-dind
+    volumes:
+      - sandbox_workspace:/sandbox/workspace
+    environment:
+      PORT: "9100"
+      SANDBOX_TOKEN: "${SANDBOX_TOKEN:-change-me-strong-token}"
+      WORKDIR: "/sandbox/workspace"
+      COMPOSE_PROJECT_NAME: "sandboxproj"
+      DOCKER_HOST: "tcp://sandbox-dind:2375"
+      DOCKER_API_VERSION: "1.43"
+    networks:
+      - sum-net
+
+  # ── SonarQube ─────────────────────────────────────────────────────────────
+  sonarqube:
+    image: sonarqube:lts-community
+    container_name: sonarqube
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    networks:
+      - sum-net
+
+volumes:
+  jenkins_home:
+  jenkins_data:
+  nexus_data:
+  sandbox_workspace:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
+
+networks:
+  sum-net:
+    driver: bridge

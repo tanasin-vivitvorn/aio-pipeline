@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: nexus
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"   # Nexus UI + REST API
+      # If you enable Docker repositories in Nexus, you typically expose extra ports, e.g.:
+      # - "8082:8082" # docker-hosted (example)
+      # - "8083:8083" # docker-proxy (example)
+
+    volumes:
+      - nexus-data:/nexus-data
+
+    environment:
+      # Helps avoid OOM on smaller machines; adjust as needed
+      - INSTALL4J_ADD_VM_PARAMS=-Xms1g -Xmx1g -XX:MaxDirectMemorySize=2g -Djava.util.prefs.userRoot=/nexus-data/javaprefs
+
+volumes:
+  nexus-data:
+    driver: local
+

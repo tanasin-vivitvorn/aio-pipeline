@@ -1,0 +1,491 @@
+pipeline {
+    agent any
+
+    parameters {
+        base64File(
+            name: 'APP_ZIP',
+            description: 'Upload ZIP (must contain docker-compose.yml at root)'
+        )
+        string(
+            name: 'NEXUS_RAW_DIRECTORY',
+            defaultValue: 'demo2',
+            description: 'Value for raw.directory when uploading to Nexus'
+        )
+        choice(
+            name: 'ZAP_SCAN_TYPE',
+            choices: ['baseline', 'full', 'api'],
+            description: 'Type of ZAP security scan'
+        )
+        booleanParam(
+            name: 'RUN_PLAYWRIGHT',
+            defaultValue: true,
+            description: 'Run Playwright tests'
+        )
+        booleanParam(
+            name: 'RUN_JMETER',
+            defaultValue: false,
+            description: 'Run JMeter performance test'
+        )
+    }
+
+    environment {
+        // Tool paths and runtime config come from the jenkins-pipeline-config ConfigMap.
+        // Only pipeline-computed values are defined here.
+        PATH = "${env.PLAYWRIGHT_HOME}/node_modules/.bin:${env.JMETER_HOME}/bin:${env.ZAP_HOME}:${PATH}"
+        TEST_DIR = "${WORKSPACE}/test-run-${BUILD_NUMBER}"
+        TARGET_URL = ""
+        NEXUS_RAW_DIRECTORY = "${params.NEXUS_RAW_DIRECTORY}"
+    }
+
+    stages {
+        stage('Verify Tools') {
+            steps {
+                sh '''#!/bin/bash
+                    echo "==================================="
+                    echo "Tool Verification"
+                    echo "==================================="
+                    echo "Node.js: $(node --version || true)"
+                    echo "NPM: $(npm --version || true)"
+                    echo "Playwright: $(playwright --version || true)"
+                    echo "JMeter: $(jmeter --version 2>&1 | head -1 || true)"
+                    echo "ZAP: $(ls ${ZAP_HOME}/zap-baseline.py 2>/dev/null && echo 'present' || echo 'not found')"
+                    echo "Python: $(python3 --version || true)"
+                    echo "jq: $(jq --version || true)"
+                    echo "==================================="
+                '''
+            }
+        }
+
+        stage('Deploy ZIP to Sandbox') {
+            steps {
+                withFileParameter('APP_ZIP') {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+
+                        mkdir -p "${TEST_DIR}/reports/playwright" "${TEST_DIR}/reports/zap" "${TEST_DIR}/reports/jmeter"
+                        echo "Test directory created: ${TEST_DIR}"
+
+                        echo "Uploading ZIP to sandbox..."
+                        cp "${APP_ZIP}" "${TEST_DIR}/app.zip"
+
+                        curl -sS -X POST "${SANDBOX_URL}/api/upload" \
+                          -H "x-sandbox-token: ${SANDBOX_TOKEN}" \
+                          -F "file=@${TEST_DIR}/app.zip" \
+                          -o "${TEST_DIR}/sandbox_response.json"
+
+                        echo "Sandbox response:"
+                        cat "${TEST_DIR}/sandbox_response.json"
+                        echo ""
+
+                        TARGET_URL="http://${SANDBOX_HOST_FOR_TEST}:${SANDBOX_APP_PORT}"
+                        echo -n "${TARGET_URL}" > "${TEST_DIR}/target_url.txt"
+
+                        SPEC_CONTENT="$(python3 -c "import json,sys; d=json.load(open('${TEST_DIR}/sandbox_response.json')); print(d.get('testSpec',{}).get('content',''))" 2>/dev/null || true)"
+                        if [ -z "${SPEC_CONTENT}" ]; then
+                            echo "⚠️ WARNING: sandbox did not return testSpec.content — Playwright tests will be skipped"
+                            touch "${TEST_DIR}/skip_playwright"
+                        else
+                            # Replace any localhost reference in the spec with the actual sandbox hostname
+                            echo "${SPEC_CONTENT}" | sed "s|localhost|${SANDBOX_HOST_FOR_TEST}|g" > "${TEST_DIR}/test.spec.ts"
+                            echo "✅ Wrote test.spec.ts from sandbox response (target: ${TARGET_URL})"
+                            echo "=== Spec Preview ==="
+                            head -n 30 "${TEST_DIR}/test.spec.ts" || true
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Inventory Scan') {
+            steps {
+                sh '''#!/bin/bash
+                    echo "==================================="
+                    echo "Running Inventory Scan"
+                    echo "==================================="
+
+                    INVENTORY_DIR="${TEST_DIR}/inventory"
+                    mkdir -p "${INVENTORY_DIR}"
+
+                    # Extract ZIP for scanning
+                    unzip -q "${TEST_DIR}/app.zip" -d "${INVENTORY_DIR}/src" 2>/dev/null || \
+                        python3 -c "import zipfile,sys; zipfile.ZipFile('${TEST_DIR}/app.zip').extractall('${INVENTORY_DIR}/src')"
+
+                    cd "${INVENTORY_DIR}"
+
+                    # Detect framework and run appropriate scanner
+                    SRC="${INVENTORY_DIR}/src"
+                    SCAN_ARGS=""
+
+                    if find "${SRC}" -name "*.tsx" -o -name "*.jsx" | grep -q .; then
+                        SCAN_ARGS="--react ${SRC}"
+                    elif find "${SRC}" -name "*.component.ts" | grep -q .; then
+                        SCAN_ARGS="--angular ${SRC}"
+                    elif find "${SRC}" -name "*.vue" | grep -q .; then
+                        SCAN_ARGS="--vue ${SRC}"
+                    elif find "${SRC}" -name "*.xml" | xargs grep -l "odoo\\|openerp" 2>/dev/null | grep -q .; then
+                        SCAN_ARGS="--odoo ${SRC}"
+                    elif find "${SRC}" -name "*.java" | xargs grep -l "@Controller\\|@RestController" 2>/dev/null | grep -q .; then
+                        SCAN_ARGS="--spring ${SRC}"
+                    else
+                        echo "Framework not detected — running all scanners"
+                        SCAN_ARGS="--react ${SRC} --angular ${SRC} --vue ${SRC} --spring ${SRC}"
+                    fi
+
+                    echo "Detected scan args: ${SCAN_ARGS}"
+                    bash /usr/local/lib/inventory/orchestrate.sh ${SCAN_ARGS} || true
+
+                    cp "${INVENTORY_DIR}/reports/inventory_summary.txt" "${TEST_DIR}/inventory_summary.txt" 2>/dev/null || true
+                    echo "Inventory scan complete"
+                    cat "${TEST_DIR}/inventory_summary.txt" 2>/dev/null || true
+                '''
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''#!/bin/bash
+                        SRC="${TEST_DIR}/inventory/src"
+
+                        if [ ! -d "${SRC}" ]; then
+                            echo "Source not found at ${SRC} — skipping SonarQube"
+                            exit 0
+                        fi
+
+                        PROJECT_KEY="build-${BUILD_NUMBER}"
+                        echo "Running SonarQube analysis on ${SRC}..."
+
+                        sonar-scanner \
+                            -Dsonar.projectKey="${PROJECT_KEY}" \
+                            -Dsonar.projectName="POC Build #${BUILD_NUMBER}" \
+                            -Dsonar.sources="${SRC}" \
+                            -Dsonar.sourceEncoding=UTF-8 \
+                            -Dsonar.scm.disabled=true || true
+
+                        echo "SonarQube analysis submitted"
+                    '''
+                }
+            }
+        }
+
+        stage('Run Playwright Tests') {
+            when { expression { params.RUN_PLAYWRIGHT == true } }
+            steps {
+                sh '''#!/bin/bash
+                    if [ -f "${TEST_DIR}/skip_playwright" ]; then
+                        echo "⚠️ Skipping Playwright tests — no test spec was provided by the sandbox"
+                        exit 0
+                    fi
+
+                    if [ ! -f "${TEST_DIR}/test.spec.ts" ]; then
+                        echo "❌ ERROR: RUN_PLAYWRIGHT is enabled but no test script found at ${TEST_DIR}/test.spec.ts"
+                        exit 1
+                    fi
+
+                    TARGET_URL="$(cat "${TEST_DIR}/target_url.txt" 2>/dev/null || true)"
+                    export BASE_URL="${TARGET_URL}"
+                    echo "Running Playwright tests against: ${TARGET_URL}"
+
+                    cp "${TEST_DIR}/test.spec.ts" /app/playwright/tests/
+                    cd /app/playwright
+                    playwright test test.spec.ts \
+                        --reporter=json \
+                        --output=./test-results 2>/dev/null \
+                        > "${TEST_DIR}/reports/playwright/results.json" || true
+
+                    echo "Playwright tests completed"
+                '''
+            }
+        }
+
+        stage('Run OWASP ZAP Security Scan') {
+            steps {
+                sh '''#!/bin/bash
+                    echo "==================================="
+                    echo "Starting OWASP ZAP Security Scan (type: ${ZAP_SCAN_TYPE})"
+                    echo "==================================="
+
+                    if [ ! -f "${ZAP_HOME}/zap.sh" ]; then
+                        echo "⚠️ ZAP not found at ${ZAP_HOME}/zap.sh — skipping scan"
+                        exit 0
+                    fi
+
+                    TARGET_URL="$(cat "${TEST_DIR}/target_url.txt" 2>/dev/null || true)"
+                    if ! echo "${TARGET_URL}" | grep -q "^http"; then
+                        echo "❌ ERROR: TARGET_URL is not set or not a valid http URL: '${TARGET_URL}'"
+                        exit 1
+                    fi
+                    echo "ZAP target: ${TARGET_URL}"
+                    mkdir -p "${TEST_DIR}/reports/zap" "${TEST_DIR}/reports/zap/session"
+
+                    ZAP_API="http://127.0.0.1:${ZAP_PORT}"
+
+                    # ZAP is started at container boot — just wait until it responds (up to 60s)
+                    echo "Checking ZAP on port ${ZAP_PORT}..."
+                    ZAP_READY=false
+                    for i in $(seq 1 12); do
+                        if curl -s "${ZAP_API}/JSON/core/view/version/" > /dev/null 2>&1; then
+                            ZAP_READY=true
+                            echo "ZAP ready (attempt ${i})"
+                            break
+                        fi
+                        echo "  waiting... (${i}/12)"
+                        sleep 5
+                    done
+
+                    if [ "${ZAP_READY}" = "false" ]; then
+                        echo "ZAP not responding. Log:"
+                        tail -30 /var/jenkins_home/zap-daemon.log || true
+                        exit 1
+                    fi
+
+                    zap_api_call() {
+                        local RESP
+                        RESP=$(curl -s "$1")
+                        if [ -z "${RESP}" ]; then
+                            echo "ERROR: empty response from ZAP API: $1" >&2
+                            echo "0"
+                        else
+                            echo "${RESP}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('scan', d.get('status','0')))"
+                        fi
+                    }
+
+                    # Spider the target
+                    echo "Starting spider on ${TARGET_URL}..."
+                    ENCODED_URL=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${TARGET_URL}")
+                    SPIDER_RESP=$(curl -s "${ZAP_API}/JSON/spider/action/scan/?url=${ENCODED_URL}&maxChildren=10&recurse=true")
+                    echo "Spider response: ${SPIDER_RESP}"
+                    SPIDER_ID=$(echo "${SPIDER_RESP}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('scan','0'))" 2>/dev/null || echo "0")
+                    echo "Spider scan ID: ${SPIDER_ID}"
+
+                    # Wait for spider to finish
+                    for i in $(seq 1 30); do
+                        PROGRESS=$(curl -s "${ZAP_API}/JSON/spider/view/status/?scanId=${SPIDER_ID}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','0'))" 2>/dev/null || echo "0")
+                        echo "  spider progress: ${PROGRESS}%"
+                        [ "${PROGRESS}" = "100" ] && break
+                        sleep 5
+                    done
+
+                    # Active scan (only for full or api type)
+                    if [ "${ZAP_SCAN_TYPE}" = "full" ] || [ "${ZAP_SCAN_TYPE}" = "api" ]; then
+                        echo "Starting active scan on ${TARGET_URL}..."
+                        ASCAN_RESP=$(curl -s "${ZAP_API}/JSON/ascan/action/scan/?url=${ENCODED_URL}&recurse=true")
+                        echo "Active scan response: ${ASCAN_RESP}"
+                        ASCAN_ID=$(echo "${ASCAN_RESP}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('scan','0'))" 2>/dev/null || echo "0")
+                        echo "Active scan ID: ${ASCAN_ID}"
+                        for i in $(seq 1 60); do
+                            PROGRESS=$(curl -s "${ZAP_API}/JSON/ascan/view/status/?scanId=${ASCAN_ID}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','0'))" 2>/dev/null || echo "0")
+                            echo "  active scan progress: ${PROGRESS}%"
+                            [ "${PROGRESS}" = "100" ] && break
+                            sleep 10
+                        done
+                    fi
+
+                    # Generate JSON report only
+                    echo "Generating ZAP JSON report..."
+                    curl -s "${ZAP_API}/OTHER/core/other/jsonreport/" \
+                        -o "${TEST_DIR}/reports/zap/zap-${ZAP_SCAN_TYPE}-report.json" || true
+                    # Also fetch alerts summary as structured JSON
+                    curl -s "${ZAP_API}/JSON/alert/view/alerts/?baseurl=${ENCODED_URL}&start=0&count=200" \
+                        -o "${TEST_DIR}/reports/zap/zap-${ZAP_SCAN_TYPE}-alerts.json" || true
+
+                    echo "ZAP security scan completed (ZAP daemon left running)"
+                '''
+            }
+        }
+
+        stage('Run JMeter Performance Test') {
+            when { expression { params.RUN_JMETER == true } }
+            steps {
+                sh '''#!/bin/bash
+                    echo "==================================="
+                    echo "Running JMeter Performance Test"
+                    echo "==================================="
+
+                    # Auto-discover JMX from extracted zip (looks for any *.jmx under inventory/src)
+                    JMX_IN_ZIP=$(find "${TEST_DIR}/inventory/src" -name "*.jmx" 2>/dev/null | head -1)
+                    if [ -n "${JMX_IN_ZIP}" ]; then
+                        cp "${JMX_IN_ZIP}" "${TEST_DIR}/jmeter-test-plan.jmx"
+                        echo "✅ Using JMeter plan: ${JMX_IN_ZIP}"
+                    fi
+
+                    if [ ! -f "${TEST_DIR}/jmeter-test-plan.jmx" ]; then
+                        echo "❌ ERROR: RUN_JMETER is enabled but no *.jmx found in zip or at ${TEST_DIR}/jmeter-test-plan.jmx"
+                        exit 1
+                    fi
+
+                    TARGET_URL="$(cat "${TEST_DIR}/target_url.txt" 2>/dev/null || true)"
+                    JMETER_HOST=$(echo "${TARGET_URL}" | sed 's|http://||' | cut -d: -f1)
+                    JMETER_PORT=$(echo "${TARGET_URL}" | sed 's|http://||' | cut -d: -f2 | cut -d/ -f1)
+                    echo "JMeter target: host=${JMETER_HOST} port=${JMETER_PORT}"
+
+                    timeout 5m jmeter -n \
+                        -t "${TEST_DIR}/jmeter-test-plan.jmx" \
+                        -Jhost="${JMETER_HOST}" \
+                        -Jport="${JMETER_PORT}" \
+                        -l "${TEST_DIR}/reports/jmeter/results.jtl" \
+                        -Jjmeterengine.force.system.exit=true
+
+                    # Convert JTL (CSV) to JSON
+                    python3 -c "
+import csv, json, sys
+rows = []
+with open('${TEST_DIR}/reports/jmeter/results.jtl', newline='') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        rows.append(row)
+with open('${TEST_DIR}/reports/jmeter/results.json', 'w') as out:
+    json.dump(rows, out, indent=2)
+print('Converted', len(rows), 'samples to JSON')
+" || true
+
+                    echo "✅ JMeter test completed"
+                '''
+            }
+        }
+
+        stage('Generate Combined Report') {
+            steps {
+                sh '''#!/bin/bash
+                    TARGET_URL="$(cat "${TEST_DIR}/target_url.txt" 2>/dev/null || echo '')"
+                    INVENTORY="$(cat "${TEST_DIR}/inventory_summary.txt" 2>/dev/null || echo '')"
+                    TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+                    python3 -c "
+import json, os, sys
+
+target_url  = os.environ.get('TARGET_URL', '')
+inventory   = os.environ.get('INVENTORY', '')
+build_num   = os.environ.get('BUILD_NUMBER', '')
+timestamp   = os.environ.get('TIMESTAMP', '')
+scan_type   = os.environ.get('ZAP_SCAN_TYPE', '')
+test_dir    = os.environ.get('TEST_DIR', '')
+
+# Load playwright results
+pw = None
+pw_path = f'{test_dir}/reports/playwright/results.json'
+if os.path.exists(pw_path):
+    with open(pw_path) as f:
+        pw = json.load(f)
+
+# Load ZAP alerts
+zap = None
+zap_path = f'{test_dir}/reports/zap/zap-{scan_type}-alerts.json'
+if os.path.exists(zap_path):
+    with open(zap_path) as f:
+        zap = json.load(f)
+
+# Load JMeter results
+jmeter = None
+jmeter_path = f'{test_dir}/reports/jmeter/results.json'
+if os.path.exists(jmeter_path):
+    with open(jmeter_path) as f:
+        jmeter = json.load(f)
+
+report = {
+    'build':     build_num,
+    'timestamp': timestamp,
+    'targetUrl': target_url,
+    'inventory': inventory,
+    'playwright': pw,
+    'zap': {
+        'scanType': scan_type,
+        'alerts':   zap
+    },
+    'jmeter': jmeter
+}
+
+out = f'{test_dir}/reports/summary-report.json'
+with open(out, 'w') as f:
+    json.dump(report, f, indent=2)
+print('Combined report written to', out)
+" TARGET_URL="${TARGET_URL}" INVENTORY="${INVENTORY}" TIMESTAMP="${TIMESTAMP}" \
+  BUILD_NUMBER="${BUILD_NUMBER}" ZAP_SCAN_TYPE="${ZAP_SCAN_TYPE}" TEST_DIR="${TEST_DIR}"
+                '''
+            }
+        }
+
+        stage('Copy Reports to Workspace') {
+            steps {
+                sh '''#!/bin/bash
+                    mkdir -p "${WORKSPACE}/reports/zap" "${WORKSPACE}/reports/playwright" "${WORKSPACE}/reports/jmeter"
+                    cp "${TEST_DIR}/reports/summary-report.json"           "${WORKSPACE}/reports/" 2>/dev/null || true
+                    cp "${TEST_DIR}/reports/playwright/results.json"       "${WORKSPACE}/reports/${BUILD_NUMBER}/playwright/" 2>/dev/null || true
+                    cp "${TEST_DIR}/reports/zap/"*.json                    "${WORKSPACE}/reports/${BUILD_NUMBER}/zap/" 2>/dev/null || true
+                    cp "${TEST_DIR}/reports/jmeter/results.json"           "${WORKSPACE}/reports/${BUILD_NUMBER}/jmeter/" 2>/dev/null || true
+
+                    echo "✅ Reports copied to workspace"
+                    find "${WORKSPACE}/reports" -type f -name "*.json" | sort || true
+                '''
+            }
+        }
+
+        stage('Upload File to Nexus') {
+            steps {
+                sh '''#!/bin/bash
+                    echo "Checking Nexus connectivity at ${NEXUS_URL}..."
+                    if ! curl -s --connect-timeout 5 "${NEXUS_URL}" > /dev/null 2>&1; then
+                        echo "WARNING: Nexus is unreachable at ${NEXUS_URL} — skipping upload"
+                        exit 0
+                    fi
+
+                    echo "Uploading file to Nexus..."
+                    HTTP_CODE=$(curl -sS -w '%{http_code}' -o "${TEST_DIR}/nexus-upload-response.json" \
+                      --connect-timeout 10 --max-time 60 \
+                      -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" -X POST \
+                      "$NEXUS_URL/service/rest/v1/components?repository=$NEXUS_REPOSITORY" \
+                      -H 'accept: application/json' \
+                      -H 'Content-Type: multipart/form-data' \
+                      -F "raw.directory=${NEXUS_RAW_DIRECTORY}" \
+                      -F "raw.asset1=@${TEST_DIR}/app.zip;type=application/zip" \
+                      -F "raw.asset1.filename=app.zip")
+
+                    echo "Nexus upload HTTP status: ${HTTP_CODE}"
+                    cat "${TEST_DIR}/nexus-upload-response.json" || true
+
+                    if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+                        echo "Nexus upload failed (HTTP ${HTTP_CODE})"
+                        exit 1
+                    fi
+
+                    echo "Nexus upload succeeded"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**/*.json', allowEmptyArchive: true
+
+            script {
+                def zapReport = "reports/zap/zap-${params.ZAP_SCAN_TYPE}-alerts.json"
+                if (fileExists(zapReport)) {
+                    def content = readFile(zapReport)
+                    if (content.contains('"riskcode":"3"') || content.contains('"riskcode":"4"')) {
+                        echo "⚠️  HIGH or CRITICAL vulnerabilities found!"
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+        }
+
+        cleanup {
+            sh '''#!/bin/bash
+              set +e
+              if [ -f "${TEST_DIR}/sandbox_response.json" ]; then
+                echo "Requesting sandbox destroy..."
+                DESTROY_BODY=$(curl -sS -o /tmp/destroy_resp.json -w "%{http_code}" \
+                  -X POST "${SANDBOX_URL}/api/destroy" \
+                  -H "x-sandbox-token: ${SANDBOX_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d '{}') || true
+                echo "Destroy HTTP status: ${DESTROY_BODY}"
+                echo "Destroy response body:"
+                cat /tmp/destroy_resp.json || true
+              fi
+              rm -rf "${TEST_DIR}" || true
+            '''
+        }
+    }
+}

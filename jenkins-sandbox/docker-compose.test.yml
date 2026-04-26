@@ -1,0 +1,36 @@
+services:
+  ldap:
+    image: bitnami/openldap:latest
+    environment:
+      LDAP_ROOT: "dc=sum,dc=local"
+      LDAP_ADMIN_USERNAME: "admin"
+      LDAP_ADMIN_PASSWORD: "admin123"
+      LDAP_USERS: "admin,dev"
+      LDAP_PASSWORDS: "admin123,dev123"
+    networks:
+      - jenkins-network
+
+  jenkins:
+    build:
+      context: ../
+      dockerfile: jenkins-sandbox/jenkins/Dockerfile
+    container_name: jenkins-test
+    ports:
+      - "8080:8080"
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+      JENKINS_OPTS: "--prefix=/jenkins"
+      LDAP_ADMIN_PASSWORD: "admin123"
+    volumes:
+      - jenkins_home_test:/var/jenkins_home
+    depends_on:
+      - ldap
+    networks:
+      - jenkins-network
+
+volumes:
+  jenkins_home_test:
+
+networks:
+  jenkins-network:
+    driver: bridge

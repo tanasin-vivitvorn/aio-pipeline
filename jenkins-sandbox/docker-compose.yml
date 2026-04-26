@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    container_name: sandbox-node
+    ports:
+      - "9100:9100"
+    environment:
+      - PORT=9100
+      # Change this token to something secret
+      - SANDBOX_TOKEN=${SANDBOX_TOKEN:-change-me-strong-token}
+      # Where uploaded projects are stored
+      - WORKDIR=/sandbox/workspace
+      # A compose project name to scope resources
+      - COMPOSE_PROJECT_NAME=sandboxproj
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbox_workspace:/sandbox/workspace
+    networks:
+      - jenkins-network
+    restart: unless-stopped
+
+volumes:
+  jenkins_home:
+    driver: local
+  sandbox_workspace:
+    driver: local
+
+networks:
+  jenkins-network:
+    driver: bridge

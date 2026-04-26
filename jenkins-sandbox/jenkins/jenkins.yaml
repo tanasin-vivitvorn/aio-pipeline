@@ -1,0 +1,49 @@
+jenkins:
+  systemMessage: "Jenkins CI/CD — authenticated via LDAP"
+  numExecutors: 2
+
+  securityRealm:
+    ldap:
+      configurations:
+        - server: "ldap://localhost:389"
+          rootDN: "dc=sum,dc=local"
+          userSearchBase: "ou=users"
+          userSearch: "uid={0}"
+          groupSearchBase: "ou=groups"
+          managerDN: "cn=admin,dc=sum,dc=local"
+          managerPasswordSecret: "${LDAP_ADMIN_PASSWORD}"
+          displayNameAttributeName: "cn"
+          mailAddressAttributeName: "mail"
+      disableMailAddressResolver: false
+      groupIdStrategy: "caseInsensitive"
+      userIdStrategy: "caseInsensitive"
+
+  authorizationStrategy:
+    globalMatrix:
+      permissions:
+        - "Overall/Administer:admin"
+        - "Overall/Read:authenticated"
+        - "Job/Build:authenticated"
+        - "Job/Read:authenticated"
+        - "Job/Workspace:authenticated"
+        - "View/Read:authenticated"
+
+unclassified:
+  sonarGlobalConfiguration:
+    buildWrapperEnabled: false
+    installations:
+      - name: "SonarQube"
+        serverUrl: "${SONAR_HOST_URL:-http://sonarqube:9000}"
+        credentialsId: "sonar-token"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              id: "sonar-token"
+              secret: "${SONAR_TOKEN:-}"
+              description: "SonarQube authentication token"
+
+jobs:
+  - file: /etc/jenkins/seed.groovy

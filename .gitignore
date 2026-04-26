@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Kubernetes kubeconfig files (may contain real cluster tokens)
+bci.yaml
+*.kubeconfig
+kubeconfig*
+*.log
+
+# Local env overrides
+.env
+.env.local
+.env.production
+
+.claude
+CLAUDE.md*
+
+module2-sandbox-dind.yml
+nexus/nexus.yml
+
+*.backup
+*.yml.backup
+INSTALLATION_GUIDE.md
+vpn-auth.txt
+vpn.ovpn

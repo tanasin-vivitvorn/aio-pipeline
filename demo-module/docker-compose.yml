@@ -1,0 +1,10 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8888/health" ]
+      interval: 3s
+      timeout: 2s
+      retries: 20
