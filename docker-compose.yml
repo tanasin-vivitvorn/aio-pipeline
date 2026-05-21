@@ -49,6 +49,8 @@ services:
       NEXUS_REPOSITORY: "sum"
       NEXUS_USERNAME: "admin"
       SONAR_HOST_URL: "http://sonarqube:9000"
+      YARA_RULES_DIR: "/app/yara/rules"
+      YARAIFY_API_URL: "https://yaraify-api.abuse.ch/api/v1/"
       # Pipeline secrets (mirrors jenkins-pipeline-secret Secret)
       SANDBOX_TOKEN: "${SANDBOX_TOKEN:-change-me-strong-token}"
       NEXUS_PASSWORD: "${NEXUS_PASSWORD:-admin123}"

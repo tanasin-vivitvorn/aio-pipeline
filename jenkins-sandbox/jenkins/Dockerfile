@@ -67,6 +67,29 @@ RUN mkdir -p /app/zap/wrk \
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
+# --- YARA + Windows malware rules ---
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y yara \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download community rules (malware + packers categories from Yara-Rules project).
+# Falls back gracefully if network is unavailable during build.
+RUN mkdir -p /app/yara/rules/community && \
+    ( curl -fsSL --retry 3 \
+        "https://github.com/Yara-Rules/rules/archive/refs/heads/master.tar.gz" \
+        -o /tmp/yara-rules.tar.gz && \
+      tar -xz -C /tmp -f /tmp/yara-rules.tar.gz && \
+      cp -r /tmp/rules-master/malware /app/yara/rules/community/ && \
+      cp -r /tmp/rules-master/packers /app/yara/rules/community/ && \
+      cp -r /tmp/rules-master/crypto  /app/yara/rules/community/ && \
+      rm -rf /tmp/yara-rules.tar.gz /tmp/rules-master && \
+      echo "Community YARA rules downloaded." \
+    ) || echo "WARNING: community rules download failed — bundled rules only."
+
+# Bundled project rules (always present)
+COPY jenkins-sandbox/jenkins/yara/ /app/yara/rules/bundled/
+
+ENV YARA_RULES_DIR=/app/yara/rules
+
 # --- SonarQube Scanner (CLI) ---
 ENV SONAR_SCANNER_VERSION=6.2.1.4610
 RUN set -e; \
@@ -94,6 +117,7 @@ RUN mkdir -p /etc/jenkins/casc_configs
 COPY jenkins-sandbox/jenkins/jenkins.yaml /etc/jenkins/casc_configs/jenkins.yaml
 COPY jenkins-sandbox/jenkins/seed.groovy /etc/jenkins/seed.groovy
 COPY jenkins-sandbox/jenkins/Jenkinsfie /etc/jenkins/Jenkinsfie
+COPY jenkins-sandbox/jenkins/Jenkinsfie-winscan /etc/jenkins/Jenkinsfie-winscan
 ENV CASC_JENKINS_CONFIG=/etc/jenkins/casc_configs/jenkins.yaml \
     LDAP_DOMAIN=sum.local \
     LDAP_USERS=admin,dev \

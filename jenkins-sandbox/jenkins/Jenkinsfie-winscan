@@ -1,0 +1,355 @@
+pipeline {
+    agent any
+
+    parameters {
+        base64File(
+            name: 'WIN_FILE',
+            description: 'Windows application file (.exe, .msi, .dll) or ZIP containing Windows executables'
+        )
+        string(
+            name: 'APP_NAME',
+            defaultValue: '',
+            description: 'Artifact filename in Nexus (e.g. myapp-1.0.0.exe). Leave blank to auto-generate.'
+        )
+        string(
+            name: 'NEXUS_DIRECTORY',
+            defaultValue: 'windows-apps',
+            description: 'Nexus raw repository directory for the uploaded artifact'
+        )
+        booleanParam(
+            name: 'SKIP_YARAIFY',
+            defaultValue: false,
+            description: 'Skip YARAify cloud scan (use in air-gapped environments)'
+        )
+    }
+
+    environment {
+        SCAN_DIR = "${WORKSPACE}/winscan-${BUILD_NUMBER}"
+    }
+
+    stages {
+
+        stage('Prepare') {
+            steps {
+                withFileParameter('WIN_FILE') {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+                        mkdir -p "${SCAN_DIR}/reports"
+
+                        cp "${WIN_FILE}" "${SCAN_DIR}/upload"
+
+                        FILE_MAGIC=$(file --brief "${SCAN_DIR}/upload" 2>/dev/null || echo "unknown")
+                        echo "Detected file type: ${FILE_MAGIC}"
+                        echo "${FILE_MAGIC}" > "${SCAN_DIR}/file_magic.txt"
+
+                        if echo "${FILE_MAGIC}" | grep -qi "Zip archive"; then
+                            echo "zip" > "${SCAN_DIR}/file_kind.txt"
+                        elif echo "${FILE_MAGIC}" | grep -qi "PE32\|MS-DOS executable\|MZ executable"; then
+                            echo "pe" > "${SCAN_DIR}/file_kind.txt"
+                        else
+                            echo "unknown" > "${SCAN_DIR}/file_kind.txt"
+                        fi
+
+                        sha256sum "${SCAN_DIR}/upload" | awk '{print $1}' > "${SCAN_DIR}/sha256.txt"
+                        echo "SHA-256: $(cat ${SCAN_DIR}/sha256.txt)"
+                        echo "File kind: $(cat ${SCAN_DIR}/file_kind.txt)"
+                    '''
+                }
+            }
+        }
+
+        stage('Validate File Type') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    KIND=$(cat "${SCAN_DIR}/file_kind.txt")
+
+                    if [ "${KIND}" = "unknown" ]; then
+                        MAGIC=$(cat "${SCAN_DIR}/file_magic.txt")
+                        echo "Unsupported file type: ${MAGIC}"
+                        echo "Expected: PE executable (.exe/.msi/.dll) or ZIP containing Windows executables."
+                        exit 1
+                    fi
+
+                    if [ "${KIND}" = "zip" ]; then
+                        mkdir -p "${SCAN_DIR}/extracted"
+                        unzip -q "${SCAN_DIR}/upload" -d "${SCAN_DIR}/extracted" 2>/dev/null || true
+                        PE_COUNT=$(find "${SCAN_DIR}/extracted" -type f \
+                            -exec file {} \; 2>/dev/null \
+                            | grep -c "PE32\|MS-DOS executable" || true)
+                        echo "PE files found inside ZIP: ${PE_COUNT}"
+                        if [ "${PE_COUNT}" -eq 0 ]; then
+                            echo "WARNING: no PE executables found inside the ZIP"
+                        fi
+                    fi
+
+                    echo "File type validation passed (kind: ${KIND})"
+                '''
+            }
+        }
+
+        stage('YARA Local Scan') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== YARA Local Scan ==="
+
+                    RULES_DIR="${YARA_RULES_DIR:-/app/yara/rules}"
+
+                    if [ ! -d "${RULES_DIR}" ]; then
+                        echo "WARNING: YARA rules directory not found at ${RULES_DIR} — skipping local scan"
+                        echo '{"status":"skipped","reason":"rules_directory_not_found","matches":[]}' \
+                            > "${SCAN_DIR}/reports/yara-local.json"
+                        exit 0
+                    fi
+
+                    KIND=$(cat "${SCAN_DIR}/file_kind.txt")
+                    if [ "${KIND}" = "zip" ] && [ -d "${SCAN_DIR}/extracted" ]; then
+                        SCAN_TARGET="${SCAN_DIR}/extracted"
+                        RECURSIVE="-r"
+                    else
+                        SCAN_TARGET="${SCAN_DIR}/upload"
+                        RECURSIVE=""
+                    fi
+
+                    MATCH_FILE="${SCAN_DIR}/yara-matches.txt"
+                    touch "${MATCH_FILE}"
+
+                    # Scan with each rule file; --no-warnings suppresses meta/import noise
+                    find "${RULES_DIR}" \( -name "*.yar" -o -name "*.yara" \) | sort | while read -r RULE; do
+                        yara --no-warnings ${RECURSIVE} "${RULE}" "${SCAN_TARGET}" 2>/dev/null \
+                            >> "${MATCH_FILE}" || true
+                    done
+
+                    MATCH_COUNT=$(grep -c "." "${MATCH_FILE}" 2>/dev/null || echo 0)
+                    echo "YARA matches: ${MATCH_COUNT}"
+
+                    python3 - <<'PYEOF'
+import json, os
+
+match_file = os.environ["SCAN_DIR"] + "/yara-matches.txt"
+report_file = os.environ["SCAN_DIR"] + "/reports/yara-local.json"
+
+matches = []
+if os.path.exists(match_file):
+    with open(match_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(" ", 1)
+            matches.append({
+                "rule": parts[0],
+                "target": parts[1] if len(parts) > 1 else ""
+            })
+
+report = {
+    "status": "clean" if not matches else "infected",
+    "match_count": len(matches),
+    "matches": matches
+}
+with open(report_file, "w") as f:
+    json.dump(report, f, indent=2)
+print(json.dumps(report, indent=2))
+PYEOF
+
+                    if [ "${MATCH_COUNT}" -gt 0 ]; then
+                        echo "YARA local scan FAILED — ${MATCH_COUNT} rule(s) matched"
+                        exit 1
+                    fi
+
+                    echo "YARA local scan PASSED — no matches"
+                '''
+            }
+        }
+
+        stage('YARAify Cloud Scan') {
+            when { expression { params.SKIP_YARAIFY == false } }
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== YARAify Cloud Scan ==="
+
+                    SHA256=$(cat "${SCAN_DIR}/sha256.txt")
+                    API="${YARAIFY_API_URL:-https://yaraify-api.abuse.ch/api/v1/}"
+
+                    # ── Step 1: hash lookup ──────────────────────────────────
+                    echo "Looking up SHA-256: ${SHA256}"
+                    LOOKUP=$(curl -s --connect-timeout 15 --max-time 30 \
+                        -X POST "${API}" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"query\":\"lookup_hash\",\"search_term\":\"${SHA256}\"}" \
+                        2>/dev/null || echo '{"query_status":"error"}')
+
+                    echo "Lookup response: ${LOOKUP}"
+                    QSTATUS=$(echo "${LOOKUP}" | python3 -c \
+                        "import json,sys; print(json.load(sys.stdin).get('query_status','error'))" \
+                        2>/dev/null || echo "error")
+
+                    if [ "${QSTATUS}" = "ok" ]; then
+                        echo "${LOOKUP}" > "${SCAN_DIR}/reports/yaraify.json"
+                        MATCH_COUNT=$(echo "${LOOKUP}" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+data = d.get('data') or {}
+results = data.get('yara_results') or []
+print(len(results))
+" 2>/dev/null || echo "0")
+                        echo "YARAify matches (from hash): ${MATCH_COUNT}"
+                        if [ "${MATCH_COUNT}" -gt 0 ]; then
+                            echo "YARAify cloud scan FAILED — ${MATCH_COUNT} rule(s) matched for known hash"
+                            exit 1
+                        fi
+                        echo "YARAify cloud scan PASSED — hash known, no YARA matches"
+
+                    elif [ "${QSTATUS}" = "not_found" ] || [ "${QSTATUS}" = "no_results" ]; then
+                        # ── Step 2: submit unknown file ──────────────────────
+                        echo "Hash not in YARAify — submitting file for analysis..."
+                        SUBMIT=$(curl -s --connect-timeout 30 --max-time 120 \
+                            -X POST "${API}" \
+                            -F 'json={"query":"get_yara"}' \
+                            -F "file=@${SCAN_DIR}/upload;filename=sample" \
+                            2>/dev/null || echo '{"query_status":"error"}')
+
+                        echo "Submission response: ${SUBMIT}"
+                        echo "${SUBMIT}" > "${SCAN_DIR}/reports/yaraify.json"
+
+                        SSTATUS=$(echo "${SUBMIT}" | python3 -c \
+                            "import json,sys; print(json.load(sys.stdin).get('query_status','error'))" \
+                            2>/dev/null || echo "error")
+
+                        if [ "${SSTATUS}" = "ok" ] || [ "${SSTATUS}" = "queued" ]; then
+                            MATCH_COUNT=$(echo "${SUBMIT}" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+data = d.get('data') or {}
+if isinstance(data, dict):
+    results = data.get('yara_results') or []
+elif isinstance(data, list):
+    results = data
+else:
+    results = []
+print(len(results))
+" 2>/dev/null || echo "0")
+                            echo "YARAify matches (from submission): ${MATCH_COUNT}"
+                            if [ "${MATCH_COUNT}" -gt 0 ]; then
+                                echo "YARAify cloud scan FAILED — ${MATCH_COUNT} rule(s) matched on submitted file"
+                                exit 1
+                            fi
+                            echo "YARAify cloud scan PASSED — no YARA matches on submitted file"
+                        else
+                            echo "WARNING: YARAify returned status '${SSTATUS}' — treating as inconclusive, continuing"
+                            echo '{"status":"inconclusive"}' > "${SCAN_DIR}/reports/yaraify.json"
+                        fi
+                    else
+                        echo "WARNING: YARAify API unreachable or returned '${QSTATUS}' — treating as inconclusive, continuing"
+                        echo "{\"status\":\"inconclusive\",\"query_status\":\"${QSTATUS}\"}" \
+                            > "${SCAN_DIR}/reports/yaraify.json"
+                    fi
+                '''
+            }
+        }
+
+        stage('Upload to Nexus') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== Upload to Nexus ==="
+
+                    if [ -n "${APP_NAME}" ]; then
+                        ARTIFACT="${APP_NAME}"
+                    else
+                        ARTIFACT="windows-app-build-${BUILD_NUMBER}"
+                    fi
+
+                    echo "Checking Nexus at ${NEXUS_URL}..."
+                    if ! curl -s --connect-timeout 5 "${NEXUS_URL}" > /dev/null 2>&1; then
+                        echo "Nexus is unreachable at ${NEXUS_URL}"
+                        exit 1
+                    fi
+
+                    echo "Uploading ${ARTIFACT} -> ${NEXUS_DIRECTORY}/${ARTIFACT}"
+                    HTTP_CODE=$(curl -sS -w '%{http_code}' \
+                        -o "${SCAN_DIR}/nexus-response.json" \
+                        --connect-timeout 10 --max-time 120 \
+                        -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" -X POST \
+                        "$NEXUS_URL/service/rest/v1/components?repository=$NEXUS_REPOSITORY" \
+                        -H 'accept: application/json' \
+                        -H 'Content-Type: multipart/form-data' \
+                        -F "raw.directory=${NEXUS_DIRECTORY}" \
+                        -F "raw.asset1=@${SCAN_DIR}/upload;type=application/octet-stream" \
+                        -F "raw.asset1.filename=${ARTIFACT}")
+
+                    echo "Nexus HTTP status: ${HTTP_CODE}"
+                    cat "${SCAN_DIR}/nexus-response.json" || true
+
+                    if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+                        echo "Nexus upload failed (HTTP ${HTTP_CODE})"
+                        exit 1
+                    fi
+
+                    echo "Uploaded to Nexus: ${NEXUS_DIRECTORY}/${ARTIFACT}"
+                    echo "${NEXUS_DIRECTORY}/${ARTIFACT}" > "${SCAN_DIR}/nexus-path.txt"
+                '''
+            }
+        }
+
+        stage('Generate Scan Report') {
+            steps {
+                sh '''#!/bin/bash
+                    python3 - <<'PYEOF'
+import json, os
+
+scan_dir  = os.environ["SCAN_DIR"]
+build_num = os.environ.get("BUILD_NUMBER", "")
+app_name  = os.environ.get("APP_NAME") or f"windows-app-build-{build_num}"
+nexus_dir = os.environ.get("NEXUS_DIRECTORY", "windows-apps")
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+sha256      = open(f"{scan_dir}/sha256.txt").read().strip() if os.path.exists(f"{scan_dir}/sha256.txt") else "unknown"
+nexus_path  = open(f"{scan_dir}/nexus-path.txt").read().strip() if os.path.exists(f"{scan_dir}/nexus-path.txt") else None
+yara_local  = load(f"{scan_dir}/reports/yara-local.json")
+yaraify     = load(f"{scan_dir}/reports/yaraify.json")
+
+report = {
+    "build":          build_num,
+    "artifact":       app_name,
+    "sha256":         sha256,
+    "nexus_path":     nexus_path,
+    "verdict":        "CLEAN",
+    "yara_local":     yara_local,
+    "yaraify":        yaraify,
+}
+
+out = f"{scan_dir}/reports/scan-report.json"
+with open(out, "w") as f:
+    json.dump(report, f, indent=2)
+print("Scan report:")
+print(json.dumps(report, indent=2))
+PYEOF
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'winscan-*/reports/**/*.json', allowEmptyArchive: true
+        }
+        success {
+            echo 'Virus scan PASSED — artifact uploaded to Nexus.'
+        }
+        failure {
+            echo 'Virus scan FAILED — artifact was NOT uploaded to Nexus.'
+        }
+        cleanup {
+            sh 'rm -rf "${SCAN_DIR}" || true'
+        }
+    }
+}

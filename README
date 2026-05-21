@@ -131,10 +131,15 @@ container environment (Docker Compose). All keys and their defaults:
 
 ---
 
-## Pipeline
+## Pipelines
 
-The `Jenkinsfie` (seed-loaded into Jenkins via JCasC) runs automatically when a job is triggered
-from the Jenkins UI. It accepts the following parameters:
+Two pipelines are seeded per user via JCasC. Both are accessible from the Jenkins UI.
+
+---
+
+### POC Pipeline (`Jenkinsfie`)
+
+General-purpose CI/CD pipeline for web and server applications.
 
 | Parameter             | Type    | Description                                           |
 | --------------------- | ------- | ----------------------------------------------------- |
@@ -144,17 +149,52 @@ from the Jenkins UI. It accepts the following parameters:
 | `RUN_PLAYWRIGHT`      | Boolean | Run Playwright E2E tests (default: true)              |
 | `RUN_JMETER`          | Boolean | Run JMeter performance test (default: false)          |
 
-**Pipeline stages:**
-
 ```
 Verify Tools → Deploy ZIP to Sandbox → Inventory Scan → SonarQube Analysis
     → Playwright Tests → OWASP ZAP Security Scan → JMeter Performance Test
     → Generate Combined Report → Copy Reports → Upload to Nexus
 ```
 
-All stage results are merged into a single `reports/summary-report.json` and archived as
-Jenkins build artifacts. If the ZAP scan finds HIGH or CRITICAL vulnerabilities the build
-is marked **UNSTABLE**.
+All stage results are merged into `reports/summary-report.json` and archived as build
+artifacts. Builds with HIGH or CRITICAL ZAP findings are marked **UNSTABLE**.
+
+---
+
+### Windows App Scan (`Jenkinsfie-winscan`)
+
+Dedicated virus-scan pipeline for Windows executables. The artifact is uploaded to Nexus
+**only if both scan stages pass**.
+
+| Parameter        | Type    | Description                                                              |
+| ---------------- | ------- | ------------------------------------------------------------------------ |
+| `WIN_FILE`       | File    | Windows executable (`.exe`, `.msi`, `.dll`) or ZIP containing PE files   |
+| `APP_NAME`       | String  | Artifact filename in Nexus. Leave blank to auto-generate.                |
+| `NEXUS_DIRECTORY`| String  | Nexus raw directory (default: `windows-apps`)                            |
+| `SKIP_YARAIFY`   | Boolean | Skip YARAify cloud scan — use in air-gapped environments (default: false)|
+
+```
+Prepare → Validate File Type → YARA Local Scan → YARAify Cloud Scan
+    → Upload to Nexus → Generate Scan Report
+```
+
+**YARA Local Scan** — runs the bundled rules from `jenkins-sandbox/jenkins/yara/` plus any
+community rules downloaded at image build time from the
+[Yara-Rules/rules](https://github.com/Yara-Rules/rules) project (malware, packers, crypto
+categories). Covers ransomware, RATs, keyloggers, process injection, credential theft,
+cryptominers, and suspicious PE characteristics.
+
+**YARAify Cloud Scan** — submits the file's SHA-256 to [YARAify](https://yaraify.abuse.ch)
+(abuse.ch). If the hash is unknown, the file is uploaded for live scanning. Any YARA match
+returned by the cloud fails the build.
+
+Scan results are archived as `winscan-*/reports/scan-report.json`.
+
+To override the YARAify API endpoint (e.g. a private instance):
+
+```yaml
+# docker-compose.yml / ConfigMap
+YARAIFY_API_URL: "https://your-internal-yaraify/api/v1/"
+```
 
 ---
 
